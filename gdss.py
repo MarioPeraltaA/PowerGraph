@@ -4,10 +4,6 @@ Author::
 
     Mario Roberto Peralta. A.
 
-For feedback::
-
-    mario.peralta@ieee.org
-
 """
 
 # Factory
@@ -19,6 +15,8 @@ import matplotlib.pyplot as plt
 import glob
 # Patterns
 import re
+# Config files
+import json
 # GIS
 import pandas as pd
 import folium
@@ -107,6 +105,7 @@ class DSSCircuit(ABC):
     bus_to_coord: dict[str, tuple[float, float]] = field(
         default_factory=dict
     )
+    bus_to_transf: dict[str, str] | None = None
     ckt_data: dict[
         str, list[dict[str, str | list[tuple[float, float]]]]
     ] = field(
@@ -459,6 +458,97 @@ class DSSCircuit(ABC):
 
         return monitor_data
 
+    def voltage_zones(
+            self
+    ) -> dict[str, list[tuple[str, float]]]:
+        """Match each transformer's buses to its voltage level."""
+        itransf = self.dss.ActiveCircuit.Transformers
+        transf_ids = itransf.AllNames
+        zones: dict[str, list[tuple[str, float]]] = {}
+        for id_ in transf_ids:
+            itransf.Name = id_  # Activates element also higher level
+            ifts = self.dss.ActiveCircuit.ActiveCktElement.Properties
+            buses = ifts("Buses").Val
+            wng_nodes = [
+                b.strip() for b in buses.strip("[]").split(",") if b.strip()
+            ]
+            wng_buses = [
+                re.sub(r'(\.\d+)+$', '', b) for b in wng_nodes
+            ]
+            kvs = ifts("kVs").Val
+            wng_kvolts = [
+                float(v) for v in kvs.strip("[]").split(",") if v.strip()
+            ]
+            zones[id_] = [(b, v) for b, v in zip(wng_buses, wng_kvolts)]
+        return zones
+
+    def get_voltage_zone(
+            self,
+            kvoltage_level: float = 1.0
+    ) -> dict[str, list[str]]:
+        """Retrieve all downstream transformers.
+
+        Given a voltage level e.g. ``1.0 kV``
+        filter out all upstream transformers above this level.
+        Create another struture to index transformer by its bus.
+
+        """
+        zones = self.voltage_zones()
+        roots: dict[str, list[str]] = {}    # Roots and their parents (hats)
+        bus_to_transf = {}
+        for id_, buses_kv in zones.items():
+            bus_id, kv = buses_kv[-1]
+            if kv < kvoltage_level:
+                roots[bus_id] = [
+                    vertex for vertex, _ in buses_kv[:-1] if vertex != bus_id
+                ]
+                bus_to_transf[bus_id] = id_
+        self.bus_to_transf = bus_to_transf
+        return roots
+
+    def map_loads(
+            self,
+            *load_path: str
+    ) -> dict[str, int]:
+        """Map load name to location code."""
+        locations_id: dict[str, int] = {}
+
+        for path in load_path:
+            with open(path, "r") as file:
+                for sentence in file:
+                    sentence = sentence.strip().lower()
+                    if "!loc=" in sentence:
+                        load_id: str = sentence.split(" ")[1]  # dss full name
+                        loc: str = (
+                            sentence.split("!loc=")[-1]
+                            .strip()
+                            .replace("-", "")
+                        )
+                        if loc:
+                            try:
+                                loc: int = int(loc)
+                            except ValueError as e:
+                                message: str = (
+                                    f"NoLocationCode: {e} "
+                                    f"of element '{load_id}'."
+                                )
+                                print(message)
+                                continue
+                            else:
+                                locations_id[load_id] = loc
+        return locations_id
+
+    def write_json(
+            self,
+            path: str,
+            data: dict
+    ):
+        """Write out data as json file."""
+        with open(
+            path, mode="w", encoding="utf-8"
+        ) as file:
+            json.dump(data, file, indent=4, ensure_ascii=False)
+
 
 @dataclass
 class GISCircuit(ABC):
@@ -620,6 +710,7 @@ class CktGraph(ABC):
     """Skeleton factory."""
 
     ckt: DSSCircuit
+    full_net: bool = False
     vertices: list[str] = field(default_factory=list)
     edges: list[tuple[str, str]] = field(default_factory=list)
     adj: dict[str, list[str]] = field(default_factory=dict)
@@ -683,23 +774,42 @@ class CktGraph(ABC):
                 continue
             self.add_edge(edge[0], edge[1])
 
+    def head_zone(
+            self
+    ) -> list[str]:
+        """Retrieve all branches seen by head meter.
+
+        This does not imply the circuit's zone it is
+        connected all the way as a single zone may still
+        have islands.
+
+        .. note::
+
+            If there is only one meter and such one it is the
+            *head meter* then in case the network it is
+            disconnected those other components would be out of
+            the *head meter*'s range.
+
+        """
+        iMeters = self.ckt.dss.ActiveCircuit.Meters
+        iMeters.Name = self.ckt.head_meter
+        return iMeters.AllBranchesInZone
+
     def collect_branches(
             self
     ):
-        """Gather branches in all zones seen by Meters."""
-        dssMeters = self.ckt.dss.ActiveCircuit.Meters
-        i = dssMeters.First
-        branches: list[str] = []
-        while i:
-            branches += dssMeters.AllBranchesInZone
-            i = dssMeters.Next
-        return branches
+        """Gather all Power Delivery Elements (PDE)"""
+        return self.ckt.dss.ActiveCircuit.PDElements.AllNames
 
     def build_graph(
-            self
+            self,
     ):
         """Generate undirected graph."""
-        branches = self.collect_branches()
+        if self.full_net:
+            branches = self.collect_branches()
+        else:
+            branches = self.head_zone()
+
         dssCircuit = self.ckt.dss.ActiveCircuit
         for edge in branches:
             if edge:
@@ -729,7 +839,7 @@ class CktGraph(ABC):
             edges: list[tuple[str, str]]
     ):
         """Turn list of edges into dict adj."""
-        nodes: list  = [end for ends in edges for end in ends]
+        nodes: list = [end for ends in edges for end in ends]
         graph: dict[str, list[str]] = {
             n: [] for n in nodes
         }
@@ -792,6 +902,54 @@ class CktGraph(ABC):
                             stack.append((child, graph[child]))
                             depth_now += 1
                             break
+                else:
+                    _ = stack.pop()
+                    depth_now -= 1
+
+    def power_dfs(
+            self,
+            graph: dict[str, list[str]],
+            root_bus: str = "lv_bus",
+            hats: list[str] = ["hv_bus, mv_bus"]
+    ):
+        """Depth First Search.
+
+        To traverse graph. If ``root`` (source) is provided
+        then yield only edges in the component reachable
+        from source. This pattern mimics `networkX <https://networkx.org/>`_.
+        See [1]_ and [2]_.
+
+        References
+        ----------
+        .. [1] http://www.ics.uci.edu/~eppstein/PADS
+        .. [2] https://en.wikipedia.org/wiki/Depth-limited_search
+
+
+        .. note::
+
+            The ``root`` is not necessary the *bus head* of the
+            electrical network.
+
+        """
+        vertices = [root_bus]
+        visited = set(hats)
+        for start in vertices:
+            if start in visited:
+                continue
+            visited.add(start)
+            stack = [(start, graph[start])]
+            depth_now = 1
+            while stack:
+                parent, children = stack[-1]
+                for child in children:
+                    if child not in visited:
+                        # Discovered edge
+                        yield parent, child
+                        visited.add(child)
+                        # Add child and grandchildren to stack
+                        stack.append((child, graph[child]))
+                        depth_now += 1
+                        break
                 else:
                     _ = stack.pop()
                     depth_now -= 1
@@ -886,3 +1044,34 @@ class CktGraph(ABC):
             output_path = f"{output_directory}{file}"
             with open(output_path, "w") as dssfile:
                 dssfile.write(micro_ckt)
+
+    def get_bunches(
+            self,
+            kvoltate_zone: float = 1.0
+    ) -> dict[str, list[str]]:
+        """Cluster loads by transformers.
+
+        Traverse down stream the graph using DFS
+        argorithm whose root is the bus where the last widing it is
+        conntected to.
+        Then gather all buses that hold a loads (fruit) in current walk train.
+        Finally Associate current transformer to this loads
+        and call it *bunch*.
+
+        """
+        roots = self.ckt.get_voltage_zone(kvoltate_zone)
+        bus_to_transf = self.ckt.bus_to_transf
+        bunches: dict[str, list[str]] = {}
+        for root, hats in roots.items():
+            train = self.power_dfs(self.adj, root, hats)
+            vertices = list({end for ends in train for end in ends})
+            # Gather all the fruits (loads) from the train
+            loads = []
+            for vertex in vertices:
+                ibus = self.ckt.dss.ActiveCircuit.ActiveBus(vertex)
+                fruits: list[str] = list(filter(None, ibus.LoadList))
+                if fruits:
+                    loads += fruits
+
+            bunches[bus_to_transf[root]] = list(set(loads))
+        return bunches
