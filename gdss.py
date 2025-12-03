@@ -106,6 +106,7 @@ class DSSCircuit(ABC):
         default_factory=dict
     )
     bus_to_transf: dict[str, str] | None = None
+    bunches_df: pd.DataFrame | None = None
     ckt_data: dict[
         str, list[dict[str, str | list[tuple[float, float]]]]
     ] = field(
@@ -243,13 +244,24 @@ class DSSCircuit(ABC):
     def set_ckt_data(
             self
     ):
-        """Orginize circuit devices and parameters."""
+        """Orginize circuit devices and parameters.
+
+        Retrain all data of the electrical model by retreving
+        all parameters values of each element of the ciruict.
+
+        .. warning::
+
+            This values are taking as string datatypes
+            so for further data or geometry analysis
+            make sure each field datatype is the proper one.
+
+        """
         elements = self.dss.ActiveCircuit.AllElementNames
 
         for device in elements:
             if device:
                 fields = {}
-                fields["dssname"] = device
+                fields["dssname"] = device.lower()
                 dss_element = (
                     self.dss.ActiveCircuit.ActiveCktElement(device)
                 )
@@ -497,7 +509,7 @@ class DSSCircuit(ABC):
         roots: dict[str, list[str]] = {}    # Roots and their parents (hats)
         bus_to_transf = {}
         for id_, buses_kv in zones.items():
-            bus_id, kv = buses_kv[-1]
+            bus_id, kv = buses_kv[-1]       # Last winding bus
             if kv < kvoltage_level:
                 roots[bus_id] = [
                     vertex for vertex, _ in buses_kv[:-1] if vertex != bus_id
@@ -548,6 +560,100 @@ class DSSCircuit(ABC):
             path, mode="w", encoding="utf-8"
         ) as file:
             json.dump(data, file, indent=4, ensure_ascii=False)
+
+    def get_bunches_df(
+            self,
+            bunches_path: str = "./City/bunches.json",
+            loads_loc_path: str = "./City/loadsloc.json"
+    ) -> pd.DataFrame:
+        r"""Hold data of bunches (group of loads).
+
+        Build efficient data structure to access group
+        of loads data. This data is:
+        Transformer name and its capacity in kVA
+        where costumer (meter) it is connected to
+        as well as load location code and its
+        average apparent power :math:`\vec{S}` as [kW, kVAr].
+
+        """
+        # Read bunches and load location as dict
+        with open(bunches_path, "r") as file:
+            bunches = json.load(file)
+
+        with open(loads_loc_path, "r") as file:
+            loads_loc = json.load(file)
+
+        # Explode clusters
+        rows: list[tuple, int] = []
+        for transfr, loads in bunches.items():
+            for load in loads:
+                load_name = load.lower()
+                if load_name in loads_loc:
+                    transfr_elem = (
+                        self.dss.ActiveCircuit
+                        .ActiveCktElement(f"transformer.{transfr}")
+                    )
+                    ifts = transfr_elem.Properties
+                    kva_str = ifts("kVA").Val
+                    load_elem = (
+                        self.dss.ActiveCircuit
+                        .ActiveCktElement(load_name)
+                    )
+                    ifts = load_elem.Properties
+                    meter_id = ifts("Daily").Val
+                    ishape = self.dss.ActiveCircuit.LoadShapes
+                    ishape.Name = meter_id
+                    kw_avg, kvar_avg = (
+                        np.average(ishape.Pmult), np.average(ishape.Qmult)
+                    )
+                    load_kva = np.sqrt(kw_avg**2 + kvar_avg**2)
+                    try:
+                        kva = float(kva_str)
+                    except ValueError as e:
+                        print(f"kVA capacity {e} of transformer {transfr}.")
+                        continue
+                    else:
+                        rows.append(
+                            (transfr,
+                             kva,
+                             load_name,
+                             loads_loc[load_name],
+                             kw_avg,
+                             kvar_avg,
+                             load_kva)
+                        )
+        # Instantiate DataFrame
+        columns: list[str] = [
+            "Transformer",
+            "kVA",          # Transformer capacity
+            "Load",
+            "Location",     # Load location code
+            "Pavg",
+            "Qavg",
+            "Savg"          # Apparent power kVA
+        ]
+        bunches_df = pd.DataFrame(
+            rows, columns=columns
+        )
+        self.bunches_df = bunches_df
+        return bunches_df
+
+    def transformer_loading_pct(
+            self
+    ) -> pd.DataFrame:
+        """Compute how loaded a transformer is."""
+        bunches_df = self.bunches_df.copy()
+        gr = bunches_df.groupby("Transformer")
+        # Add up groups loading
+        agg = gr.agg(
+            Ptot=("Pavg", "sum"),
+            Qtot=("Qavg", "sum"),
+            kVA=("kVA", "first")   # All rows in a group have same kVA
+        ).reset_index()
+        # Compute apparent power and then loading as percentage
+        agg["S"] = np.sqrt(agg['Ptot']**2 + agg['Qtot']**2)
+        agg["Loading"] = 100.0 * agg['S'] / agg['kVA']
+        return agg
 
 
 @dataclass
@@ -681,7 +787,7 @@ class GISCircuit(ABC):
         ckt_map = folium.Map(
             crs="EPSG3857",
             control_scale=True,
-            tiles="cartodbpositron",
+            tiles="CartoDB.PositronNoLabels",
             zoom_start=15
         )
         for c, (layer, gdf) in enumerate(self.layers.items()):
@@ -798,7 +904,7 @@ class CktGraph(ABC):
     def collect_branches(
             self
     ):
-        """Gather all Power Delivery Elements (PDE)"""
+        """Gather all Power Delivery Elements (PDE)."""
         return self.ckt.dss.ActiveCircuit.PDElements.AllNames
 
     def build_graph(
@@ -979,7 +1085,6 @@ class CktGraph(ABC):
 
         Parameters
         ----------
-
         start_up_vertices : list[tuple[str, int]]
             Top nodes of each graph path as pairs
             ``(root_bus, depth_limit)``
@@ -991,7 +1096,6 @@ class CktGraph(ABC):
             in a connected one.
 
         """
-
         for root, depth in start_up_vertices:
             branches = self.dfs_edges(self.adj, root, depth)
             for edge in branches:
