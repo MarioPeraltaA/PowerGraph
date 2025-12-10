@@ -114,7 +114,7 @@ class DSSCircuit(ABC):
     )
     buses: dict[str, tuple[float, float]] = field(default_factory=dict)
     head_meter: str = ""
-    head_monitor: list = field(default_factory=list)   # Both PWR and VI
+    head_monitors: list[str, str] = field(default_factory=list)   # PWR, VI
     dss: IDSS = field(init=False)
 
     def __post_init__(
@@ -375,9 +375,18 @@ class DSSCircuit(ABC):
             source_bus_id: str = "sourcebus",
             terminal: int = 1,
     ):
-        """Embed EnergyMeter right at feeders head.
+        """Embed EnergyMeter right at feeder's head.
 
         To assess Topology analysis and collect global Registers.
+
+        Raises
+        ------
+        TypeError
+            As only and solely one PDE must be connected
+            to this sourcebus.
+
+        ValueError
+            Floating sourcebus.
 
         .. warning::
 
@@ -386,13 +395,39 @@ class DSSCircuit(ABC):
             at all.
 
         """
-        bus_obj = self.dss.ActiveCircuit.ActiveBus(source_bus_id)
-        feeder_branch = bus_obj.AllPDEatBus[0]   # Full name without nodes
-        if feeder_branch:
-            _ = self.dss.ActiveCircuit.ActiveCktElement(feeder_branch)
-            element_id = self.dss.ActiveClass.Name  # Single name
+        ibus_obj = self.dss.ActiveCircuit.ActiveBus(source_bus_id)
+        pd_elements = ibus_obj.AllPDEatBus
+        # Full name branches
+        pd_elements = self.dss.ActiveCircuit.ActiveBus.AllPDEatBus
+        pd_elements = [
+            None if (e) and (e.lower() in {"none", "nan", "null"}) else e
+            for e in pd_elements
+        ]
+        # Kick out falsy items
+        feeder_branches = list(filter(None, pd_elements))
+        # Add meter
+        try:
+            if feeder_branches:
+                n_branches = len(feeder_branches)
+                if n_branches != 1:
+                    raise TypeError("Multiple branches at head.")
+            else:
+                raise ValueError("No PDE at feeder.")
+        except ValueError as e:
+            logg = (
+                f"EmptyBranches: {e}"
+            )
+            print(logg)
+        except TypeError as e:
+            logg = (
+                f"NonUniqueHead: {e}"
+            )
+        else:
+            branch = feeder_branches[0]
+            _ = self.dss.ActiveCircuit.SetActiveElement(branch)
+            element_id = self.dss.ActiveClass.Name
             meter_id = self.add_meter(
-                feeder_branch, f"{element_id}_meter", terminal
+                branch, f"{element_id}_meter", terminal
             )
             self.head_meter = meter_id
 
@@ -402,20 +437,62 @@ class DSSCircuit(ABC):
             terminal: int = 1,
             mode: int = enums.MonitorModes.Power
     ):
-        """Deploy monitors to each PDE connected to sourcebus.
+        """Deploy monitors to first PDE connected to sourcebus.
 
-        To keep an eye on external network.
+        To keep an eye on external network modeled as
+        the main circuit source.
+
+        Raises
+        ------
+        TypeError
+            As only and solely one PDE must be connected
+            to this sourcebus.
+
+        ValueError
+            Floating sourcebus.
+
+        .. warning::
+
+            The command :py:attr:`iBus.AllPDEatBus` it is not reliable
+            as may return branches whose Bus has not connections
+            at all.
 
         """
-        bus_obj = self.dss.ActiveCircuit.ActiveBus(source_bus_id)
-        feeder_branch = bus_obj.AllPDEatBus[0]   # Full name without nodes
-        if feeder_branch:
-            _ = self.dss.ActiveCircuit.ActiveCktElement(feeder_branch)
-            element_id = self.dss.ActiveClass.Name  # Single name
-            monitor_id = self.add_monitor(
-                feeder_branch, f"{element_id}_monitor_{mode}", terminal, mode
+        ibus_obj = self.dss.ActiveCircuit.ActiveBus(source_bus_id)
+        pd_elements = ibus_obj.AllPDEatBus
+        # Full name branches
+        pd_elements = self.dss.ActiveCircuit.ActiveBus.AllPDEatBus
+        pd_elements = [
+            None if (e) and (e.lower() in {"none", "nan", "null"}) else e
+            for e in pd_elements
+        ]
+        # Kick out falsy items
+        feeder_branches = list(filter(None, pd_elements))
+        # Add monitor, check for unique item
+        try:
+            if feeder_branches:
+                n_branches = len(feeder_branches)
+                if n_branches != 1:
+                    raise TypeError("Multiple branches at head.")
+            else:
+                raise ValueError("No PDE at feeder.")
+        except ValueError as e:
+            logg = (
+                f"EmptyBranches: {e}"
             )
-            self.head_monitor.append(monitor_id)
+            print(logg)
+        except TypeError as e:
+            logg = (
+                f"NonUniqueHead: {e}"
+            )
+        else:
+            branch = feeder_branches[0]   # Full name without nodes
+            _ = self.dss.ActiveCircuit.SetActiveElement(branch)
+            element_id = self.dss.ActiveClass.Name
+            monitor_id = self.add_monitor(
+                branch, f"{element_id}_monitor_{mode}", terminal, mode
+            )
+            self.head_monitors.append(monitor_id)
 
     def get_meter_data(
             self,
